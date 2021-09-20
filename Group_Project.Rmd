@@ -1,0 +1,263 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(XLConnect)
+library(tidyverse)
+#library(xlsx)
+library(dplyr)
+library(lubridate)
+library(forecast)
+setwd("G:/My Drive/BAN 673/Group Project/")
+```
+
+
+```{r}
+#Code block to take original xlsx file and clean the data and export to a csv file
+#No need to run this code block after initial data cleaning
+dataset <- readWorksheetFromFile('PET_PRI_GND_DCUS_NUS_M.xls',sheet="Data 1", header=FALSE)
+#head(dataset)
+dataset.gas <- dataset[,c(1,6)] #choosing date column and our data values
+dataset.gas <- janitor::row_to_names(dataset.gas,3) # removing the unused header rows
+colnames(dataset.gas) <- c("Date", "Gas_Prices") #changing column names
+dataset.gas$`Gas_Prices` <- as.numeric(dataset.gas$`Gas_Prices`) #changing gas price column to numeric data type
+#is.numeric(dataset.gas$`Gas_Prices`) #checking to see if the it changed to numeric
+dataset.gas <- dataset.gas %>% slice(2:371)#removing the first data point due to null value
+dataset.gas$Date <- as.Date(dataset.gas$Date)#changing the date column from char to date
+#str(dataset.gas$Date)#testing if date code worked
+write.csv(dataset.gas, "Gas Dataset.csv",col.names=TRUE,row.names=FALSE) #export data to a csv
+```
+
+
+
+```{r}
+gas.dataset <- read.csv('Gas Dataset.csv')
+
+#changing it to time series data
+gas.ts <- ts(gas.dataset$Gas_Prices,
+             start = c(1990, 9), end = c(2021, 6), freq = 12)
+
+#time series components plot
+gas.stl <- stl(gas.ts, s.window='periodic')
+autoplot(gas.stl, main= "Gas Price Time Series Components")
+#You can see an overall upward trend of the data, showing the gas price over time is increasing
+
+#plotting data
+plot(gas.ts, ylab = "Gas Price", xlab = "Year", main = "Cost of Unleaded Gasoline in the United States", xaxt = 'n')
+axis(1, at = seq(1990, 2021, 1), labels = format(seq(1990, 2021,1)))
+
+#autocorrelation
+autocor <- Acf(gas.ts, lag.max=12)
+#all the data points are highly correlated, which means there is a very high degree of seasonality to the data..
+
+#partitioning the Data
+nValid <- 36 #validation period in number of months 
+nTrain <- length(gas.ts) - nValid
+train.ts <- window(gas.ts, start = c(1990, 9), end = c(1990, nTrain))
+valid.ts <- window(gas.ts, start = c(1990, nTrain + 1), 
+                   end = c(1990, nTrain + nValid))
+```
+
+```{r}
+#Random Walk test
+gas.ts.ar1 <- Arima(gas.ts, order = c(1,0,0))
+summary(gas.ts.ar1)
+
+z.stat <- (0.9871 - 1)/0.0076
+z.stat #-1.697368
+p.value <-pnorm(z.stat) 
+p.value #0.04481351
+
+#autocorrelation chart
+diff.gas.ts <- diff(gas.ts, lag=1)
+diff.gas.ts
+Acf(diff.gas.ts, lag.max=8,
+    main = "Autocorrelation for Walmart Revenue")
+```
+
+
+```{r}
+#1st level of Arima model with training dataset using validation data as prediction
+
+#Linear Trend
+train.lin <- tslm(train.ts ~ trend)
+summary(train.lin)
+train.lin.pred <- forecast(train.lin, h = nValid, level = 0)
+
+#Regression model with Quadratic trend
+train.quad <- tslm(train.ts ~ trend + I(trend^2))
+summary(train.quad)
+train.quad.pred <- forecast(train.quad, h = nValid, level = 0)
+
+#Regression model with Seasonality
+train.season <- tslm(train.ts ~ season)
+summary(train.season)
+train.season.pred <- forecast(train.season, h = nValid, level = 0)
+
+#Regression Model with linear trend and seasonality
+train.lin.season <- tslm(train.ts ~ trend + season)
+summary(train.lin.season)
+train.lin.season.pred <- forecast(train.lin.season, h = nValid, level = 0)
+
+#Regression model with quadratic trend and seasonality
+train.quad.season <- tslm(train.ts ~ trend + I(trend^2) + season)
+summary(train.quad.season)
+train.quad.season.pred <- forecast(train.quad.season, h = nValid, level = 0)
+
+#accuracy of the models
+round(accuracy(train.lin.pred$mean, valid.ts), 3)#linear model
+round(accuracy(train.quad.pred$mean, valid.ts), 3) #quadratic model
+round(accuracy(train.season.pred$mean, valid.ts), 3) #seasonlity model, not statistically significant, but best MAPE
+round(accuracy(train.lin.season.pred$mean, valid.ts),3) #linear + seasonality model
+round(accuracy(train.quad.season.pred$mean, valid.ts),3) #quadratic + seasonality model
+```
+
+
+```{r}
+#2nd level ARIMA model with training data using validation data as prediction dataset
+# lags (up to maximum of 12).
+Acf(train.quad.season.pred$residuals, lag.max = 12, 
+    main = "Autocorrelation for Gas Prices Training Residuals")
+
+#Arima 1 model
+res.ar1 <- Arima(train.quad.season$residuals, order = c(1,0,0)) #1= order 1, auto regressive model, no integration, no moving average
+summary(res.ar1)
+
+# Use forecast() function to make prediction of residuals in validation set.
+res.ar1.pred <- forecast(res.ar1, h = nValid, level = 0)
+#res.ar1.pred
+
+valid.two.level.pred <- train.quad.season.pred$mean + res.ar1.pred$mean
+
+Acf(res.ar1.pred$residuals, lag=12,
+    main = 'Autocorrelation for Residuals of 2-level training model')
+
+round(accuracy(train.quad.season.pred$mean + res.ar1.pred$mean, valid.ts), 3) #18.532 MAPE
+round(accuracy(train.quad.season.pred$mean, valid.ts), 3) #33.52 MAPE
+```
+
+
+```{r}
+#Regression model with quadratic trend + Seasonality
+whole.quad.season <- tslm(gas.ts ~ trend + I(trend^2) + season)
+summary(whole.quad.season)
+whole.quad.season.pred <- forecast(whole.quad.season, h = 12, level = 0)
+
+#round(accuracy(whole.season.pred$fitted, gas.ts), 3) #seasonlity model
+
+#2nd level ARIMA model with training data using validation data as prediction dataset
+Acf(whole.quad.season.pred$residuals, lag.max = 12, 
+    main = "Autocorrelation for Gas Prices Residuals")
+
+#Arima 1 model
+whole.res.ar1 <- Arima(whole.quad.season$residuals, order = c(1,0,0)) #1= order 1, auto regressive model, no integration, no moving average
+summary(whole.res.ar1)
+
+
+# Use forecast() function to make prediction of residuals in validation set.
+whole.res.ar1.pred <- forecast(whole.res.ar1, h = nValid, level = 0)
+#res.ar1.pred
+
+Acf(whole.res.ar1.pred$residuals, lag=12,
+    main = 'Autocorrelation of Residuals for 2-level model on whole dataset')
+
+round(accuracy(whole.quad.season$fitted + whole.res.ar1$fitted, gas.ts), 3) #4.35 MAPE
+round(accuracy(whole.quad.season$fitted, gas.ts), 3) #19.357 MAPE
+round(accuracy((snaive(gas.ts))$fitted, gas.ts),3) #15.095 MAPE
+round(accuracy((naive(gas.ts))$fitted, gas.ts),3) #4.158 MAPE
+```
+
+
+```{r}
+#auto-arima model
+
+#training the model
+train.auto.arima <- auto.arima(train.ts)
+summary(train.auto.arima)
+
+#forecasting the values
+train.auto.arima.pred <- forecast(train.auto.arima, h = nValid, level = 0)
+train.auto.arima.pred
+
+Acf(train.auto.arima.pred$residuals, lag=12,
+    main = 'Autocorrelation of Residuals for auto arima training model')
+
+#accuracy of the model
+round(accuracy(train.auto.arima.pred$mean, valid.ts), 3)#11.907 MAPE
+
+#training model on the whole dataset
+auto.arima <- auto.arima(gas.ts)
+summary(auto.arima)
+
+#forecasting the values
+auto.arima.pred <- forecast(auto.arima, h = 12, level = 0)
+#auto.arima.pred
+
+Acf(auto.arima.pred$residuals, lag=12,
+    main = 'Autocorrelation of Residuals for auto arima model on the whole dataset')
+
+round(accuracy(auto.arima.pred$fitted, gas.ts), 3)#3.768 MAPE
+```
+
+
+
+```{r}
+#Holt-Winter's model
+hw.ZZZ <- ets(train.ts, model  = 'ZZZ')
+hw.ZZZ# model = MAM, multiplicative error, additive trend, multiplicative seasonality
+
+#creating prediction values with validation period as prediction
+hw.ZZZ.pred <- forecast(hw.ZZZ, h =nValid, level=0)
+hw.ZZZ.pred
+
+Acf(hw.ZZZ.pred$residuals, lag=12,
+    main = "Autocorrelation of Residuals for Holt-Winter's training model")
+
+round(accuracy(hw.ZZZ.pred$mean, gas.ts),3)
+```
+
+```{r}
+#plotting the graph on the prediction versus actual data
+plot(hw.ZZZ.pred$mean, 
+     xlab = "Year", ylab = "Gas Price in US Dollars", ylim = c(0, 4), bty = "l",
+     xaxt = "n", xlim = c(1990, 2021), 
+     main = "Holt-Winter's Model with Automated Selection of Model Options", 
+     lty = 5, col = "blue", lwd = 2) 
+axis(1, at = seq(1990, 2021, 1), labels = format(seq(1990, 2021, 1)))
+lines(hw.ZZZ.pred$fitted, col = "blue", lwd = 2)
+lines(gas.ts)
+#legend code doesn't work yet
+legend(3,4, 
+       legend = c("Ridership", 
+                  "Holt-Winter's Automated Model for Training Partition",
+                  "Holt-Winter's Automated Model for Validation Partition"), 
+       col = c("black", "blue" , "blue"), 
+       lty = c(1, 1, 2), lwd =c(1, 2, 2), bty = "n")
+
+```
+
+```{r}
+#Running Holt-Winter's model with the whole dataset
+HW.ZZZ <- ets(gas.ts, model='ZZZ')
+HW.ZZZ #M Ad M
+
+HW.ZZZ.pred <-forecast(HW.ZZZ, h=12,level=95) #trying to predict the next 4 months gas prices
+HW.ZZZ.pred
+
+Acf(HW.ZZZ.pred$residuals, lag=12,
+    main = "Autocorrelation of Residuals for Holt-Winter's model on the whole dataset")
+
+round(accuracy(HW.ZZZ.pred$fitted, gas.ts), 3) #MAPE= 4.145
+round(accuracy((naive(gas.ts))$fitted, gas.ts), 3) #MAPE = 4.158
+round(accuracy((snaive(gas.ts))$fitted, gas.ts), 3) #MAPE = 15.095
+```
+
+
+
+
